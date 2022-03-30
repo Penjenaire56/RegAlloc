@@ -3,20 +3,22 @@ open Printf
 
 (* DataStructure *)
 module SSet = Set.Make(String);;
+module ISet = Set.Make(Int);;
 module IMap = Map.Make(Int);;
+module SMap = Map.Make(String);;
 
-module Vertice = Map.Make(struct
-    type t = int * int 
+module Vertice = Set.Make(struct
+    type t = string * string 
     let compare = compare
 end);;
 
 type graph = {
     (* L'ensemble des liens d'interférences *)
-    adjSet : (int * int) Vertice.t;
+    adjSet : Vertice.t;
     (* L'ensemble temporaire des interférences *)
-    adjList : SSet.t IMap.t;
+    adjList : SSet.t SMap.t;
     (* Degree courrant des nodes *)
-    degree : int IMap.t;
+    degree : int SMap.t;
 };;
 
 (* Debug *)
@@ -51,13 +53,16 @@ let printNodeSet (nodes) =
 let printIMap f m = 
     IMap.fold (fun i v s -> s ^ (string_of_int i) ^ (f v)) m ""
 
+let verticesToString v = 
+    Vertice.fold (fun (x,y) t -> t ^ "(" ^ x ^ "," ^ y ^")") v ""
+
+let printGraph g = 
+    eprintf "%s\n" (verticesToString (g.adjSet))
+
 (* Main *)
 
 
 (* Temporaire *)
-let simplifyWorklist = []
-let freezeWorklist = []
-let spillWorklist = []
 let spilledNodes = []
 
 (* Fonction principale
@@ -65,25 +70,30 @@ let spilledNodes = []
     Fait l'allocation des registres en implémentant la version du Tiger Book
 *)
 let rec regalloc(listInst : instr list) = 
+    let precolored = SMap.empty in
+    let initial = SSet.empty in 
     let (nodes, nodes_in, nodes_out) = livenessAnalysis(listInst) in 
     printNode(nodes);
-    eprintf "IN : ";
+    eprintf "IN : \n";
     printNodeSet(nodes_in);
-    eprintf "OUT : ";
+    eprintf "OUT : \n";
     printNodeSet(nodes_out);
 
-    let (_, worklistMoves, _, _) =  build(nodes) in 
+    let (moveList, worklistMoves, _, g) =  
+        build nodes precolored (IMap.find ((List.length listInst) - 2) nodes_out) in 
+   
     eprintf "%s" (printIMap instrToString worklistMoves);
-    makeWorkList();
+    printGraph g;
+    let (spillWorklist, freezeWorklist, simplifyWorklist) = makeWorkList initial g moveList in
     
     let rec aux_alloc () = 
-        if simplifyWorklist <> [] then
+        if not(SSet.is_empty simplifyWorklist) then
             (simplify() ; aux_alloc())
         else if not(IMap.is_empty worklistMoves) then 
             (coalesce(); aux_alloc())
-        else if freezeWorklist <> [] then 
+        else if not(SSet.is_empty  freezeWorklist) then 
             (freeze(); aux_alloc())
-        else if spillWorklist <> [] then 
+        else if not(SSet.is_empty spillWorklist) then 
             (selectSpill(); aux_alloc())
         else 
             assignColors();
@@ -94,16 +104,18 @@ let rec regalloc(listInst : instr list) =
 
 (* Analyse de liveness *)
 and livenessAnalysis (listInst : instr list) = 
+    let listInst = List.rev listInst in
+    let len = List.length listInst in
     (* Initialisation des sets In et Out et création de la map regroupant les nodes *)
     let rec live_empty (i : int) = function 
         | [] -> (IMap.empty, IMap.empty, IMap.empty)
         | (x : instr) :: subL -> 
-            let (nodes, node_in, node_out) = live_empty (i + 1) subL in
+            let (nodes, node_in, node_out) = live_empty (i - 1) subL in
                 (IMap.add i (x) nodes,
                  IMap.add i (SSet.empty) node_in,
                  IMap.add i (SSet.empty) node_out)
 
-    in let (nodes, node_in', node_out') = live_empty 0 listInst
+    in let (nodes, node_in', node_out') = live_empty len listInst
     
     (* Calcule des In et Out par recherche de point fixe *)
     in let rec update node_in' node_out' = 
@@ -124,7 +136,7 @@ and livenessAnalysis (listInst : instr list) =
         in if (IMap.equal (=) node_in' node_in) && (IMap.equal (=) node_out' node_out) then
             (nodes, node_in, node_out)
         else
-            update node_in node_out
+            (update node_in node_out)
     in (update node_in' node_out')
 
 (* Fonction calculant les successeurs d'une instruction
@@ -192,34 +204,34 @@ and useN (i : instr) =
 (*  Construit le graph d'interférence 
 
 *)
-and build (instMap : instr IMap.t) = 
-    let moveList = 
-        IMap.fold (fun i _ m -> IMap.add i (SSet.empty) m) instMap IMap.empty 
+and build (instMap : instr IMap.t) precolored (liveout : SSet.t) = 
+    let moveList : ISet.t SMap.t = 
+        SMap.empty 
     in
     let worklistMoves = IMap.empty in
     
     (* TODO Ajouter les variables existante avant *)
-    let live = SSet.empty in   
+    let live = liveout in   
     let g : graph = {
         adjSet = Vertice.empty;
-        adjList = IMap.empty;
-        degree = IMap.empty;
+        adjList = SMap.empty; 
+        degree = SMap.empty;
     } in IMap.fold(fun n v (m, w, l, g) -> 
             match v with 
             | Move(_,_) ->
                 let (m, w, l, g) = (build_move n v (m, w, l, g)) in 
-                    (build_allinstr v (m, w , l, g))
-            | _ -> (build_allinstr v (m, w , l, g))
+                    (build_allinstr v (m, w , l, g) precolored)
+            | _ -> (build_allinstr v (m, w , l, g) precolored)
         ) instMap
         (moveList, worklistMoves, live, g) 
 
 (* Construit les dépendances de l'instruction dans le graph d'interférence *)
-and build_allinstr (i : instr) (m, w, live, graph) = 
+and build_allinstr (i : instr) (m, w, live, graph) precolored = 
     let live = SSet.union live (defN i) in 
 
     let graph = SSet.fold (fun d graph -> 
         SSet.fold (fun l graph -> 
-            (addEdge graph d l) 
+            (addEdge graph d l precolored) 
         ) live graph
     ) (defN i) graph in 
 
@@ -237,17 +249,65 @@ and build_move (n : int) (i : instr) (moveList, worklistMoves, live, g) =
         (moveList, worklistMoves, live, g)
 
 and moveListUpdate n x moveList = 
-    IMap.add x (SSet.union 
-        (IMap.find x moveList)
-        (SSet.singleton n)
+    SMap.add n (ISet.union 
+        (SMap.find n moveList)
+        (ISet.singleton x)
     ) moveList
 
 (* Ajout des liens dans le graphs *)
-and addEdge g _ _ : graph = g
+and addEdge g u v precolored : graph =
+    match Vertice.find_opt (u,v) g.adjSet with 
+    | None when u <> v ->
+        let g = notPrecolored precolored u v g in
+        let g = notPrecolored precolored v u g in
+        {
+            adjSet = 
+                Vertice.union 
+                    (g.adjSet) 
+                    (Vertice.union 
+                        (Vertice.singleton (u,v))
+                        (Vertice.singleton (v,u))
+                    );
+            adjList = g.adjList;
+            degree = g.degree;
+        }
+    | _ -> g
 
+(* Ajoute la variable x au degree et au adjList si non précoloré *)
+and notPrecolored precolored u v g =
+    match SMap.find_opt u precolored with 
+    | None -> {
+        adjSet = g.adjSet;
+        adjList = 
+            (match SMap.find_opt u g.adjList with
+            | None -> 
+                SMap.add u (SSet.singleton v) g.adjList
+            | Some(f) -> 
+                SMap.add u (SSet.union f (SSet.singleton v)) g.adjList);
+        degree = 
+            (match SMap.find_opt u g.degree with
+            | None -> 
+                SMap.add u 0 g.degree
+            | Some(f) -> 
+                SMap.add u (f + 1) g.degree)
+    }
+    | _ -> g
 
 (* Temporaire *)
-and makeWorkList () = ()
+and makeWorkList (initial : SSet.t) (g : graph) moveList =
+    SSet.fold (fun n (spill,freeze,simplify) -> 
+        if (SMap.find n g.degree) > 1 then
+            (SSet.union spill (SSet.singleton n),freeze,simplify)
+        else if (SMap.find_opt n moveList) != None then
+            (spill,SSet.union freeze (SSet.singleton n),simplify)
+        else
+            (spill,freeze, SSet.union simplify (SSet.singleton n))  
+    ) initial (SSet.empty,SSet.empty,SSet.empty)
+
+
+
+
+
 and simplify () = ()
 and coalesce () = ()
 and freeze () = ()

@@ -22,4 +22,4 @@ let example1 = [
 ;;
 
 
-Regalloc.regalloc(example1)
+Regalloc.regalloc example1
